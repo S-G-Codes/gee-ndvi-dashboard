@@ -11,6 +11,7 @@ from google.auth.transport.requests import Request
 # Read configuration from environment variables
 project_id = os.getenv('EE_PROJECT_ID') or os.getenv('GCP_PROJECT') or 'gee-assignment-469904'
 service_account_key_file = os.getenv('GOOGLE_APPLICATION_CREDENTIALS') or os.getenv('SERVICE_ACCOUNT_FILE') or 'E:\\gee_assignment_key.json'
+service_account_key_json = os.getenv('GOOGLE_APPLICATION_CREDENTIALS_JSON')
 
 app = FastAPI()
 
@@ -23,22 +24,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Earth Engine
-try:
-    # Use the service account credentials directly
-    credentials = service_account.Credentials.from_service_account_file(
-        service_account_key_file,
-        scopes=['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/earthengine']
-    )
-    
-    # Initialize Earth Engine with the authenticated credentials
-    ee.Initialize(credentials, project=project_id)
-    print("Earth Engine initialized successfully with service account.")
-except Exception as e:
-    print(f"Failed to initialize Earth Engine: {e}")
-    # Handle the case where initialization fails gracefully
-    ee.Initialize(project=project_id)
-    print("Fallback: Initialized with default credentials (might not work as intended).")
+# Lazy EE initialization
+_credentials = None
+_ee_initialized = False
+
+def init_ee_once():
+    global _credentials, _ee_initialized
+    if _ee_initialized:
+        return
+    try:
+        # Prefer JSON from env if provided (Cloud Run secret as env)
+        if service_account_key_json and service_account_key_json.strip().startswith('{'):
+            info = json.loads(service_account_key_json)
+            _credentials = service_account.Credentials.from_service_account_info(
+                info,
+                scopes=['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/earthengine']
+            )
+        # Otherwise try file path
+        elif service_account_key_file and os.path.exists(service_account_key_file):
+            _credentials = service_account.Credentials.from_service_account_file(
+                service_account_key_file,
+                scopes=['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/earthengine']
+            )
+        # Else rely on default ADC (Cloud Run service account)
+        if _credentials is not None:
+            ee.Initialize(_credentials, project=project_id)
+        else:
+            ee.Initialize(project=project_id)
+        _ee_initialized = True
+        print("EE initialized (lazy)")
+    except Exception as e:
+        print(f"EE init failed (lazy): {e}")
+        # Do not crash; endpoints will report errors
 
 @app.get("/")
 def root():
@@ -46,53 +63,36 @@ def root():
 
 @app.get("/test")
 async def test():
+    init_ee_once()
     try:
-        # Define AOI (NYC)
         aoi = ee.Geometry.Point([-74.006, 40.7128]).buffer(20000)
-
-        # Sentinel-2 collection
         collection = (ee.ImageCollection('COPERNICUS/S2')
                       .filterBounds(aoi)
                       .filterDate('2024-09-01', '2025-08-01')
                       .sort('CLOUDY_PIXEL_PERCENTAGE'))
-
         image = collection.first()
-
-        # Compute NDVI
         ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI')
-
-        # Visualization params
         vis_params = {
             'min': 0,
             'max': 1,
             'palette': ['brown', 'yellow', 'green']
         }
-
-        # Get the map ID and tile URL template
         map_id = ndvi.getMapId(vis_params)
-        print('Map ID Info:', map_id)
-
         if not map_id:
             raise Exception("Failed to get map ID from Earth Engine.")
-
-        # Ensure access token
-        access_token = credentials.token if 'credentials' in globals() else None
-        if not access_token or (hasattr(credentials, 'expired') and credentials.expired):
-            credentials.refresh(Request())
-            access_token = credentials.token
-            print("Access token refreshed.")
+        access_token = None
+        if _credentials is not None:
+            access_token = _credentials.token
+            if not access_token or (hasattr(_credentials, 'expired') and _credentials.expired):
+                _credentials.refresh(Request())
+                access_token = _credentials.token
         if not access_token:
             raise Exception("Failed to obtain a valid access token.")
-
         tile_url = f"https://earthengine.googleapis.com/v1alpha/projects/{project_id}/maps/{map_id['mapid']}/tiles/{{z}}/{{x}}/{{y}}?token={access_token}"
-
         return JSONResponse(content={
             "tile_url": tile_url,
             "image_count": collection.size().getInfo(),
-            "date_range": {
-                "start": "2024-09-01",
-                "end": "2025-08-01"
-            }
+            "date_range": {"start": "2024-09-01", "end": "2025-08-01"}
         })
     except Exception as e:
         print(f"Error in /test endpoint: {e}")
@@ -100,6 +100,7 @@ async def test():
 
 @app.get("/ndvi-tiles")
 def get_ndvi_tiles():
+    init_ee_once()
     try:
         nyc = ee.Geometry.Rectangle([-74.25909, 40.477399, -73.700272, 40.917577])
         today = datetime.now()
@@ -118,7 +119,6 @@ def get_ndvi_tiles():
             image_count = s2.size().getInfo()
         if image_count == 0:
             return {"error": f"No Sentinel-2 images found for NYC in the last 2 years"}
-
         def maskS2clouds(image):
             qa = image.select('QA60')
             cloudBitMask = 1 << 10
@@ -126,53 +126,38 @@ def get_ndvi_tiles():
             mask = qa.bitwiseAnd(cloudBitMask).eq(0).And(
                 qa.bitwiseAnd(cirrusBitMask).eq(0))
             return image.updateMask(mask).divide(10000)
-
         s2Masked = s2.map(maskS2clouds)
         ndviCollection = s2Masked.map(lambda img: 
             img.normalizedDifference(['B8', 'B4']).rename('NDVI')\
                .copyProperties(img, ['system:time_start'])
         )
         ndviMedian = ndviCollection.median().clip(nyc)
-        ndviVis = {
-            'min': -0.2,
-            'max': 0.8,
-            'palette': ['red', 'orange', 'yellow', 'lightgreen', 'green', 'darkgreen']
-        }
+        ndviVis = {'min': -0.2, 'max': 0.8, 'palette': ['red', 'orange', 'yellow', 'lightgreen', 'green', 'darkgreen']}
         map_id = ndviMedian.getMapId(ndviVis)
         if not map_id:
             raise Exception("Failed to get map ID from Earth Engine.")
-
-        # Ensure access token
-        access_token = credentials.token if 'credentials' in globals() else None
-        if not access_token or (hasattr(credentials, 'expired') and credentials.expired):
-            credentials.refresh(Request())
-            access_token = credentials.token
-            print("Access token refreshed.")
+        access_token = None
+        if _credentials is not None:
+            access_token = _credentials.token
+            if not access_token or (hasattr(_credentials, 'expired') and _credentials.expired):
+                _credentials.refresh(Request())
+                access_token = _credentials.token
         if not access_token:
             raise Exception("Failed to obtain a valid access token.")
-
         tile_url = f"https://earthengine.googleapis.com/v1alpha/projects/{project_id}/maps/{map_id['mapid']}/tiles/{{z}}/{{x}}/{{y}}?token={access_token}"
-
-        return {
-            "tile_url": tile_url,
-            "image_count": image_count,
-            "date_range": {
-                "start": start_date.strftime('%Y-%m-%d'),
-                "end": today.strftime('%Y-%m-%d')
-            },
-            "auth_method": "service_account_token"
-        }
+        return {"tile_url": tile_url, "image_count": image_count, "date_range": {"start": start_date.strftime('%Y-%m-%d'), "end": today.strftime('%Y-%m-%d')}, "auth_method": "service_account_token"}
     except Exception as e:
         print(f"Error in get_ndvi_tiles: {e}")
         return {"error": str(e)}
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "gee_initialized": ee.data.getAssetRoots() is not None}
+    return {"status": "ok", "gee_initialized": _ee_initialized}
 
 @app.get("/time-series/{lat}/{lng}")
 def get_time_series(lat: float, lng: float):
     """Get NDVI time series for a specific point"""
+    init_ee_once()
     try:
         # Create point geometry
         point = ee.Geometry.Point([lng, lat])
@@ -247,6 +232,7 @@ def get_time_series(lat: float, lng: float):
 @app.get("/aoi/{aoi_name}")
 def get_aoi_data(aoi_name: str):
     """Get NDVI data for different Areas of Interest"""
+    init_ee_once()
     try:
         # Define different AOIs
         aois = {
@@ -319,10 +305,10 @@ def get_aoi_data(aoi_name: str):
             raise Exception("Failed to get map ID from Earth Engine.")
         
         # Get the access token
-        access_token = credentials.token
-        if not access_token or credentials.expired:
-            credentials.refresh(Request())
-            access_token = credentials.token
+        access_token = _credentials.token
+        if not access_token or _credentials.expired:
+            _credentials.refresh(Request())
+            access_token = _credentials.token
         
         if not access_token:
             raise Exception("Failed to obtain a valid access token.")
@@ -339,7 +325,7 @@ def get_aoi_data(aoi_name: str):
                 "end": today.strftime('%Y-%m-%d')
             }
         }
-        
+
     except Exception as e:
         print(f"Error in get_aoi_data: {e}")
         return {"error": str(e)}
@@ -347,6 +333,7 @@ def get_aoi_data(aoi_name: str):
 @app.get("/stats/{lat}/{lng}")
 def get_pixel_stats(lat: float, lng: float):
     """Get pixel statistics for a specific point"""
+    init_ee_once()
     try:
         # Create point geometry
         point = ee.Geometry.Point([lng, lat])

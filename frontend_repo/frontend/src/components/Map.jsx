@@ -39,7 +39,7 @@ const MapComponent = () => {
   const [clickedPoint, setClickedPoint] = useState(null);
 
   // Initialize map
-  useEffect(() => {
+ useEffect(() => {
     if (!mapRef.current) return;
 
     // Clean up existing map
@@ -51,9 +51,9 @@ const MapComponent = () => {
     const timer = setTimeout(() => {
       try {
         // Initialize map
-        const map = L.map(mapRef.current, {
-          zoomControl: true,
-          minZoom: 3,
+  const map = L.map(mapRef.current, {
+    zoomControl: true,
+    minZoom: 3,
           maxZoom: 19,
           center: [40.7128, -74.006],
           zoom: 10
@@ -63,7 +63,7 @@ const MapComponent = () => {
 
         // Add base layer
         const baseLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-          attribution: '&copy; OpenStreetMap contributors'
+    attribution: '&copy; OpenStreetMap contributors'
         });
         baseLayer.addTo(map);
         baseLayerRef.current = baseLayer;
@@ -81,14 +81,14 @@ const MapComponent = () => {
       }
     }, 100);
 
-    return () => {
+  return () => {
       clearTimeout(timer);
       if (mapInstanceRef.current) {
         mapInstanceRef.current.remove();
         mapInstanceRef.current = null;
       }
-    };
-  }, []);
+  };
+}, []);
 
   // Load NDVI data
   const loadNDVIData = async () => {
@@ -335,9 +335,9 @@ const MapComponent = () => {
         </p>
       </div>
 
-      <div
-        ref={mapRef}
-        id="map"
+    <div
+      ref={mapRef}
+      id="map"
         style={{ height: '100%', width: '100%', marginTop: '60px' }}
       />
       
