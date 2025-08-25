@@ -1,10 +1,9 @@
-import MapView from "./components/Mapview";
-
+import MapComponent from "./components/Map";
 
 function App() {
   return (
-    <div>
-     <MapView/>
+    <div style={{ height: '100vh', width: '100vw', margin: 0, padding: 0 }}>
+     <MapComponent />
     </div>
   );
 }
